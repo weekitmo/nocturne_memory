@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "nocturne_memory": {
+      "command": "python",
+      "args": [
+        "/absolute/path/to/nocturne_memory/backend/mcp_server.py"
+      ]
+    }
+  }
+}

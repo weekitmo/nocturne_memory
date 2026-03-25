@@ -188,13 +188,13 @@ Nocturne Memory 采用极简但高可用（High-Availability）的 **SQLite/Post
 
 执行步骤：
 1. Git clone https://github.com/Dataojitori/nocturne_memory.git 到当前目录。
-2. 进入目录，运行 pip install -r backend/requirements.txt
+2. 进入目录，优先使用 `uv pip install -r backend/requirements.txt`；如果没有 `uv`，则使用 `pip install -r backend/requirements.txt`
 3. 复制 .env.example 为 .env
 4. 【关键】获取当前目录的绝对路径，修改 .env 中的 DATABASE_URL，确保它指向绝对路径。
 5. 【关键】询问我使用的是哪个客户端（Claude/Cursor/Antigravity etc）。
    - 如果是 **Antigravity**：args 必须指向 `backend/mcp_wrapper.py`（解决 Windows CRLF 问题）。
    - 其他客户端：指向 `backend/mcp_server.py`。
-   - 生成对应的 MCP 的 JSON 配置供我复制。
+   - 基于 `mcp.example.json` 生成对应的 MCP JSON 配置供我复制。
 ```
 
 ---
@@ -206,9 +206,24 @@ Nocturne Memory 采用极简但高可用（High-Availability）的 **SQLite/Post
 ```bash
 git clone https://github.com/Dataojitori/nocturne_memory.git
 cd nocturne_memory
+```
+
+使用 `uv`：
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -r backend/requirements.txt
+```
+
+或继续使用 `pip`：
+
+```bash
 pip install -r backend/requirements.txt
 ```
 > **注意**：MCP 客户端会直接调用你系统 `PATH` 中的 `python`。如果你使用虚拟环境，需要在 MCP 配置中将 `command` 指向该虚拟环境的 python 可执行文件路径。
+>
+> **补充**：某些环境下，SQLAlchemy 异步运行时还需要 `greenlet`。该依赖现已包含在 [backend/requirements.txt](/Users/weekit/development/nocturne_memory/backend/requirements.txt) 中。
 
 ### 2. 配置环境变量
 
@@ -249,6 +264,8 @@ CORE_MEMORY_URIS=core://agent,core://my_user,core://agent/my_user
 
 ### 3. 配置 MCP 客户端
 
+仓库中的 [mcp.example.json](/Users/weekit/development/nocturne_memory/mcp.example.json) 是可提交模板。复制一份为本地 `mcp.json` 后，再把路径改成你机器上的实际路径。
+
 在你的 AI 客户端（Claude Desktop, Cursor, Windsurf, OpenCode 等）的 MCP 配置中加入：
 
 ```json
@@ -260,11 +277,12 @@ CORE_MEMORY_URIS=core://agent,core://my_user,core://agent/my_user
         "C:/absolute/path/to/nocturne_memory/backend/mcp_server.py"
       ]
     }
-
   }
 }
 ```
 > **Windows 用户**：路径使用正斜杠 `/` 或双反斜杠 `\\`。
+>
+> **如果你使用虚拟环境**：将 `command` 改成对应解释器路径，例如 `.venv/bin/python`（Linux/Mac）或 `.venv\\Scripts\\python.exe`（Windows）。
 
 ### ⚠️ Special Fix for Antigravity on Windows
 由于 Antigravity IDE 在 Windows 上的 stdin/stdout 换行符处理 bug（CRLF vs LF），直接运行 server.py 会报错。

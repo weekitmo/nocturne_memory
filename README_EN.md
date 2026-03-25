@@ -187,13 +187,13 @@ Please deploy Nocturne Memory MCP Server for me.
 
 Steps:
 1. Git clone https://github.com/Dataojitori/nocturne_memory.git to the current directory.
-2. Enter the directory, run pip install -r backend/requirements.txt
+2. Enter the directory and prefer `uv pip install -r backend/requirements.txt`; if `uv` is unavailable, use `pip install -r backend/requirements.txt`
 3. Copy .env.example to .env
 4. [CRITICAL] Get the absolute path of the current directory. Modify DATABASE_URL in .env to point to that absolute path.
 5. [CRITICAL] Ask me which client I'm using (Claude/Cursor/Antigravity etc).
    - If **Antigravity**: args must point to `backend/mcp_wrapper.py` (fixes Windows CRLF issue).
    - Other clients: point to `backend/mcp_server.py`.
-   - Generate the corresponding MCP JSON config for me to copy.
+   - Generate the corresponding MCP JSON config for me based on `mcp.example.json`.
 ```
 
 ---
@@ -205,9 +205,24 @@ Steps:
 ```bash
 git clone https://github.com/Dataojitori/nocturne_memory.git
 cd nocturne_memory
+```
+
+Using `uv`:
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -r backend/requirements.txt
+```
+
+Or keep using `pip`:
+
+```bash
 pip install -r backend/requirements.txt
 ```
 > **Note**: MCP clients invoke `python` directly from your system `PATH`. If you use a virtual environment, you need to point `command` in the MCP config to the python executable path of that virtual environment.
+>
+> **Note**: In some environments, SQLAlchemy's async runtime also needs `greenlet`. That dependency is now included in [backend/requirements.txt](/Users/weekit/development/nocturne_memory/backend/requirements.txt).
 
 ### 2. Configure Environment Variables
 
@@ -248,6 +263,8 @@ CORE_MEMORY_URIS=core://agent,core://my_user,core://agent/my_user
 
 ### 3. Configure MCP Client
 
+The repository now includes a committable template at [mcp.example.json](/Users/weekit/development/nocturne_memory/mcp.example.json). Copy it to a local `mcp.json` and replace the paths with the real paths on your machine.
+
 Add the following to your AI client's (Claude Desktop, Cursor, Windsurf, OpenCode, etc.) MCP configuration:
 
 ```json
@@ -259,11 +276,12 @@ Add the following to your AI client's (Claude Desktop, Cursor, Windsurf, OpenCod
         "C:/absolute/path/to/nocturne_memory/backend/mcp_server.py"
       ]
     }
-
   }
 }
 ```
 > **Windows users**: Use forward slashes `/` or double backslashes `\\` in paths.
+>
+> **If you use a virtual environment**: point `command` to that interpreter, for example `.venv/bin/python` on Linux/Mac or `.venv\\Scripts\\python.exe` on Windows.
 
 ### ⚠️ Special Fix for Antigravity on Windows
 Due to a stdin/stdout newline handling bug (CRLF vs LF) in Antigravity IDE on Windows, running server.py directly will throw errors.

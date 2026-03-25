@@ -11,10 +11,13 @@ __pycache__/
 *$py.class
 *.so
 frontend/node_modules
+.uv-cache/
 snapshots/
 assets/
 frontend/dist/
 backups/
+mcp.json
+.learnings/
 
 # Sisyphus tooling artifacts
 .sisyphus/
