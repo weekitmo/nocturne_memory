@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from api import review_router, browse_router, maintenance_router
 from auth import BearerTokenAuthMiddleware
+from namespace_middleware import NamespaceMiddleware
 from db import get_db_manager, close_db
 from health import router as health_router
 
@@ -31,7 +32,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Graph API",
     description="AI长期记忆知识图谱后端",
-    version="1.3.1",
+    version="2.1.1",
     lifespan=lifespan,
 )
 
@@ -39,6 +40,8 @@ app.add_middleware(
     BearerTokenAuthMiddleware,
     excluded_paths=["/health"],
 )
+
+app.add_middleware(NamespaceMiddleware)
 
 # CORS设置
 app.add_middleware(
@@ -59,7 +62,7 @@ app.include_router(maintenance_router)
 @app.get("/")
 async def root():
     """根路径"""
-    return {"message": "Knowledge Graph API", "version": "1.3.1", "docs": "/docs"}
+    return {"message": "Knowledge Graph API", "version": "2.1.1", "docs": "/docs"}
 
 
 if __name__ == "__main__":

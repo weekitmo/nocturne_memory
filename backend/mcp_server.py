@@ -17,6 +17,7 @@ Multiple paths can point to the same memory (aliases).
 import os
 import re
 import sys
+import unicodedata
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv, find_dotenv
@@ -30,6 +31,7 @@ from db import (
     get_db_manager, get_graph_service, get_glossary_service,
     get_search_indexer, close_db,
 )
+from db.namespace import get_namespace
 from db.snapshot import get_changeset_store
 import contextlib
 
@@ -176,6 +178,9 @@ def _record_rows(
     Overwrite semantics are handled by the store:
     - First touch of a PK: stores both before and after.
     - Subsequent touches: overwrites after only; before is frozen.
+
+    Changes are written to the namespace-specific store so that each agent's
+    review queue remains isolated.
     """
     store = get_changeset_store()
     store.record_many(before_state, after_state)
@@ -193,6 +198,268 @@ def write_tool():
 
 
 # =============================================================================
+# Text Normalization for Patch Matching
+# =============================================================================
+# When the LLM reads memory content and re-emits it as old_string, subtle
+# character-level differences creep in (curly vs straight quotes, dash
+# variants, trailing whitespace, consecutive space collapse).  These helpers
+# let update_memory fall back to a normalized comparison when the exact match
+# fails, while keeping a position map so the replacement targets the correct
+# range in the original content.
+# =============================================================================
+
+_NORM_CHAR_MAP = str.maketrans(
+    {
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u00ab": '"',
+        "\u00bb": '"',
+        "\uff02": '"',
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u00b4": "'",
+        "\uff07": "'",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\uff0d": "-",
+    }
+)
+
+
+def _normalize_with_positions(
+    text: str,
+    *,
+    preserve_first_line_indent: bool = True,
+) -> Tuple[str, List[int]]:
+    """
+    Normalize *text* for matching and build a position map.
+
+    Returns ``(normalized, pos_map)`` where ``pos_map[i]`` is the index in
+    the **NFC-normalized** input that produced the *i*-th character of the
+    normalized output.
+
+    Steps applied in order:
+
+    1. Unicode NFC (compose decomposed sequences)
+    2. Quote / dash variant → ASCII equivalent  (1-to-1, no position shift)
+    3. Trailing ``[ \\t]`` per line stripped
+    4. Consecutive spaces collapsed to one (leading indentation protected)
+
+    When *preserve_first_line_indent* is ``False``, the very first line's
+    leading whitespace is treated as ordinary inline spacing (collapsed),
+    because the caller is normalizing a snippet (``old_string``) whose first
+    line may start mid-line rather than at a true line beginning.  Lines 2+
+    always preserve their leading indentation regardless of this flag.
+    """
+    text = unicodedata.normalize("NFC", text)
+    substituted = text.translate(_NORM_CHAR_MAP)
+
+    out: List[str] = []
+    pos_map: List[int] = []
+    lines = substituted.split("\n")
+    offset = 0
+
+    for line_idx, original_line in enumerate(lines):
+        if line_idx > 0:
+            out.append("\n")
+            pos_map.append(offset - 1)
+
+        # Handle Windows CRLF: remove \r from the line we process,
+        # but keep it in the original length calculation for offset.
+        line = original_line
+        if line.endswith("\r"):
+            line = line[:-1]
+
+        content_end = len(line.rstrip(" \t"))
+
+        # Protect leading indentation from space-collapsing — except on the
+        # first line when preserve_first_line_indent is False (snippet mode).
+        protect_indent = (line_idx > 0) or preserve_first_line_indent
+        leading_ws = 0
+        if protect_indent:
+            for ci in range(content_end):
+                if line[ci] in (" ", "\t"):
+                    leading_ws += 1
+                else:
+                    break
+
+        prev_space = False
+        for ci in range(content_end):
+            ch = line[ci]
+
+            if ci < leading_ws:
+                # Always preserve leading indentation exactly as-is
+                out.append(ch)
+                pos_map.append(offset + ci)
+                continue
+
+            if ch == " ":
+                if prev_space:
+                    continue
+                prev_space = True
+            else:
+                prev_space = False
+
+            out.append(ch)
+            pos_map.append(offset + ci)
+
+        offset += len(original_line) + 1
+
+    return "".join(out), pos_map
+
+
+def _find_valid_matches(
+    norm_content: str,
+    candidate: str,
+    *,
+    indent_collapsed: bool,
+) -> List[int]:
+    """
+    Find all positions where *candidate* occurs in *norm_content*, rejecting
+    hits that would **slide into the middle of another line's indentation**.
+
+    This guard exists because a space/tab at the start of *candidate* could
+    coincidentally align with part of a deeper indentation block in the
+    content, producing a match that silently corrupts whitespace structure.
+
+    The guard only fires when the hit falls inside a pure-indentation prefix
+    (every character between the line start and the hit position is a space or
+    tab).  If ANY non-whitespace character precedes the hit on the same line,
+    the space is ordinary inline content and the hit is always accepted.
+
+    *indent_collapsed*: whether the candidate's first line had its leading
+    whitespace collapsed (i.e. ``preserve_first_line_indent=False`` was used
+    during normalization).  This affects how strictly we reject indent-region
+    hits:
+
+    - ``False`` (indent preserved): the candidate's leading whitespace was
+      kept verbatim, so a hit inside an indentation region is only invalid if
+      it doesn't start at the line's very beginning (shorter indent sliding
+      into deeper indent).
+    - ``True`` (indent collapsed): the candidate's leading whitespace was
+      already folded, so ANY hit that falls inside an indentation region is
+      suspect — we can't trust the whitespace count to anchor it.
+
+    Returns a list of valid match positions (indices into *norm_content*).
+    """
+    # Check whether the candidate starts with whitespace.  If it doesn't,
+    # there's no risk of sliding into an indentation block, so every hit is
+    # valid and we can skip the per-hit line analysis entirely.
+    first_line = candidate.split("\n", 1)[0]
+    could_slide_into_indent = (
+        bool(first_line) and first_line[0] in (" ", "\t")
+    )
+
+    hits: List[int] = []
+    start = 0
+    while True:
+        pos = norm_content.find(candidate, start)
+        if pos == -1:
+            break
+
+        valid = True
+        if could_slide_into_indent:
+            # Determine whether this hit sits inside the indentation region
+            # of its line (= only whitespace between line-start and hit).
+            line_start = norm_content.rfind("\n", 0, pos)
+            line_start = line_start + 1 if line_start != -1 else 0
+            prefix = norm_content[line_start:pos]
+            hit_is_in_indent_region = (
+                prefix == "" or all(c in (" ", "\t") for c in prefix)
+            )
+
+            if hit_is_in_indent_region:
+                if indent_collapsed:
+                    # Collapsed mode: any indent-region hit is unreliable
+                    # because the candidate's leading ws was folded away.
+                    if prefix != "":
+                        valid = False
+                else:
+                    # Preserved mode: reject only if hit didn't start at
+                    # the line beginning (= shorter indent inside deeper).
+                    if pos != line_start:
+                        valid = False
+
+        if valid:
+            hits.append(pos)
+        start = pos + 1
+
+    return hits
+
+
+def _try_normalized_patch(
+    content: str, old_string: str, new_string: str
+) -> Optional[str]:
+    """
+    Attempt to locate *old_string* inside *content* via normalized comparison.
+
+    Returns the patched content when **exactly one** valid normalized match
+    exists, or ``None`` when no match is found or the match is ambiguous.
+    """
+    # NFC-normalize content so that pos_map indices (which are computed from
+    # the NFC'd text inside _normalize_with_positions) align with the string
+    # we slice from.  Write boundaries also do NFC for new data, but
+    # historical records may still contain decomposed characters.
+    content = unicodedata.normalize("NFC", content)
+    norm_content, pos_map = _normalize_with_positions(content)
+
+    if not pos_map:
+        return None
+
+    # We don't know whether old_string's first line starts at a true line
+    # beginning or mid-line.  Generate candidates for both modes, collect all
+    # valid matches, then require exactly one across both modes combined.
+    all_results: List[Tuple[int, str]] = []  # (position, candidate)
+    for preserve in (True, False):
+        candidate = _normalize_with_positions(
+            old_string, preserve_first_line_indent=preserve
+        )[0]
+        if not candidate:
+            continue
+        valid_hits = _find_valid_matches(
+            norm_content, candidate, indent_collapsed=(not preserve)
+        )
+        for hit in valid_hits:
+            # Deduplicate: same position + same candidate length = same match
+            if not any(h == hit and len(c) == len(candidate) for h, c in all_results):
+                all_results.append((hit, candidate))
+
+    if len(all_results) != 1:
+        return None  # 0 = not found, >1 = ambiguous
+
+    idx, norm_old = all_results[0]
+
+    orig_start = pos_map[idx]
+    match_end = idx + len(norm_old)
+    if match_end < len(pos_map):
+        orig_end = pos_map[match_end]
+    else:
+        orig_end = pos_map[-1] + 1
+
+    # If the matched text starts with \n but the original text has \r\n,
+    # orig_start will point to \n, leaving \r dangling.
+    if (orig_start < len(content) and content[orig_start] == '\n'
+            and orig_start > 0 and content[orig_start - 1] == '\r'):
+        orig_start -= 1
+
+    # If the matched text ends right before a CRLF, preserve the \r.
+    if (orig_end < len(content) and content[orig_end] == '\n'
+            and orig_end > 0 and content[orig_end - 1] == '\r'):
+        orig_end -= 1
+
+    # Normalize new_string's line endings to match the content's convention.
+    if '\n' in new_string:
+        clean = new_string.replace('\r\n', '\n').replace('\r', '\n')
+        if '\r\n' in content:
+            new_string = clean.replace('\n', '\r\n')
+        else:
+            new_string = clean
+
+    return content[:orig_start] + new_string + content[orig_end:]
+
+
+# =============================================================================
 # Helper Functions
 # =============================================================================
 
@@ -207,7 +474,7 @@ async def _fetch_and_format_memory(uri: str) -> str:
     domain, path = parse_uri(uri)
 
     # Get the memory
-    memory = await graph.get_memory_by_path(path, domain)
+    memory = await graph.get_memory_by_path(path, domain, namespace=get_namespace())
 
     if not memory:
         raise ValueError(f"URI '{make_uri(domain, path)}' not found.")
@@ -216,6 +483,7 @@ async def _fetch_and_format_memory(uri: str) -> str:
         memory["node_uuid"],
         context_domain=domain,
         context_path=path,
+        namespace=get_namespace(),
     )
 
     # Format output
@@ -240,7 +508,7 @@ async def _fetch_and_format_memory(uri: str) -> str:
     else:
         lines.append("Disclosure: (not set)")
 
-    node_keywords = await glossary.get_glossary_for_node(memory["node_uuid"])
+    node_keywords = await glossary.get_glossary_for_node(memory["node_uuid"], namespace=get_namespace())
     if node_keywords:
         lines.append(f"Keywords: [{', '.join(node_keywords)}]")
     else:
@@ -257,7 +525,7 @@ async def _fetch_and_format_memory(uri: str) -> str:
 
     # Glossary scan: detect glossary keywords present in the content
     try:
-        glossary_matches = await glossary.find_glossary_in_content(content)
+        glossary_matches = await glossary.find_glossary_in_content(content, namespace=get_namespace())
         if glossary_matches:
             current_node_uuid = memory["node_uuid"]
             
@@ -385,7 +653,7 @@ async def _generate_memory_index_view(domain_filter: Optional[str] = None) -> st
     graph = get_graph_service()
 
     try:
-        paths = await graph.get_all_paths()
+        paths = await graph.get_all_paths(namespace=get_namespace())
 
         # --- Step 1: Group all paths by (domain, node_uuid) ---
         node_groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
@@ -471,7 +739,7 @@ async def _generate_recent_memories_view(limit: int = 10) -> str:
     graph = get_graph_service()
 
     try:
-        results = await graph.get_recent_memories(limit=limit)
+        results = await graph.get_recent_memories(limit=limit, namespace=get_namespace())
 
         lines = []
         lines.append("# Recently Modified Memories")
@@ -522,7 +790,7 @@ async def _generate_glossary_index_view() -> str:
     glossary = get_glossary_service()
 
     try:
-        raw_entries = await glossary.get_all_glossary()
+        raw_entries = await glossary.get_all_glossary(namespace=get_namespace())
         
         # Filter out truly pathless (unlinked) nodes
         entries = []
@@ -650,18 +918,38 @@ async def create_memory(
 
     Args:
         parent_uri: Parent URI (e.g., "core://agent", "writer://chapters")
-                    Use "core://" or "writer://" for root level in that domain
+                    Use "core://" or "writer://" for root level in that domain.
                     parent_uri MUST be an existing node, or it will cause an ERROR.
-        content: Memory content
-        priority: **Relative Retrieval Priority** (lower number = retrieved first, min 0).
-                    Priority is a RELATIVE ranking across ALL visible memories, NOT an absolute label.
-                    *   **禁止**把所有记忆都设成同一个数字（如全部设为0或1），那等于没有排序。
-                    *   **正确做法**：先观察当前视野中所有其它记忆的 priority 值，
-                        然后为新记忆选一个能体现其相对重要性的数字，插入到合适的位置。
-                    *   例：视野中已有 priority 1, 3, 5 的记忆，新记忆比3重要但不如1，就设为2。
-        title: Optional title. If not provided, auto-assigns numeric ID
+
+                    Choose the parent whose reader would most likely need this new content.
+                    Parent-child here means associative relevance, not taxonomic "is-a" classification.
+                    (e.g., A memory about user's diet habits belongs under "core://user/health"
+                    or "core://user/preferences", NOT under a meaningless container like "core://logs").
+        content: Memory content.
+        priority: Relative retrieval priority (lower = retrieved first, min 0).
+                    This is a RELATIVE ranking against ALL memories currently in your mind,
+                    not just siblings under the same parent.
+                    How to choose:
+                    1. Consider the priorities of all memories you are aware of.
+                    2. Find one you consider more important and one less important than the new memory.
+                    3. Set priority between them.
+                    Hard caps: priority=0 max 5 across entire library; priority=1 max 15.
+                    If a tier is full, demote the weakest existing entry before inserting.
+        title: Optional title (alphanumeric, hyphens, underscores only).
+               If not provided, auto-assigns numeric ID.
         disclosure: A short trigger condition describing WHEN to read_memory() this node.
-                    Think: "In what specific situation would I need to know this?"
+                    Write it as the situation BEFORE the failure would occur, not the failure itself.
+                    The trigger must fire while there is still time to change behavior.
+
+                    Example of disclosure logic:
+
+                    If a memory records that you once gave unsolicited diet advice when your user
+                    mentioned skipping breakfast, and they found it patronizing:
+                      BAD: "When I start lecturing about nutrition" (already mid-failure)
+                      GOOD: "When the user mentions skipping a meal" (specific trigger, fires before I react)
+
+                    Also BAD: "important", "remember" (zero information).
+                    Every memory MUST have a disclosure. Omitting it = unreachable memory.
 
     Returns:
         The created memory's full URI
@@ -688,6 +976,7 @@ async def create_memory(
             title=title,
             disclosure=disclosure if disclosure else None,
             domain=domain,
+            namespace=get_namespace(),
         )
 
         created_uri = result.get("uri", make_uri(domain, result["path"]))
@@ -695,10 +984,11 @@ async def create_memory(
 
         return (
             f"Success: Memory created at '{created_uri}'\\n\\n"
-            f"[SYSTEM REMINDER]: A memory without triggers is a book sealed in a box. "
-            f"Use `manage_triggers` NOW to wire this memory into your recall network. "
-            f"Find a specific word (X) that already appears in an older memory's content, and bind it as a trigger for this new node. "
-            f"(e.g. manage_triggers('<this_uri>', add=['specific_word_from_old_memory']))"
+            f"[SYSTEM REMINDER]: Look around your memory network. Are there existing memories related to this one? "
+            f"Would reading them trigger a need to recall this new memory? If yes, link them!\\n"
+            f"- If the related memories are few and this memory's scope is narrow, use `add_alias`.\\n"
+            f"- If the related memories are many and this memory's scope is broad, consider using `manage_triggers`.\\n"
+            f"- (Never invent arbitrary placeholder words just to force a trigger.)"
         )
 
     except ValueError as e:
@@ -718,34 +1008,32 @@ async def update_memory(
 ) -> str:
     """
     Updates an existing memory to a new version.
-    The old version will be deleted.
-    警告：update之前需先read_memory，确保你知道你覆盖了什么。
+
+    PREREQUISITE: You MUST call read_memory(uri) and read the full content BEFORE calling this.
+    Updating without reading first is a forbidden operation.
 
     Only provided fields are updated; others remain unchanged.
 
     Two content-editing modes (mutually exclusive):
 
-    1. **Patch mode** (primary): Provide old_string + new_string.
-       Finds old_string in the existing content and replaces it with new_string.
-       old_string must match exactly ONE location in the content.
-       To delete a section, set new_string to empty string "".
+    1. Patch mode (primary): Provide old_string + new_string.
+       old_string must match exactly ONE location in the existing content.
+       To delete a section, set new_string to "".
 
-    2. **Append mode**: Provide append.
-       Adds the given text to the end of existing content.
+    2. Append mode: Provide append.
+       Adds text to the end of existing content.
 
-    There is NO full-replace mode. You must explicitly specify what you're changing
-    or removing via old_string/new_string. This prevents accidental content loss.
+    There is NO full-replace mode.
 
     Args:
         uri: URI to update (e.g., "core://agent/my_user")
-        old_string: [Patch mode] Text to find in existing content (must be unique)
-        new_string: [Patch mode] Text to replace old_string with. Use "" to delete a section.
-        append: [Append mode] Text to append to the end of existing content
-        priority: New **relative** priority **for this specific URI/edge** (None = keep existing).
-                  Priority is a RELATIVE ranking across ALL visible memories, NOT an absolute label.
-                  It is bound to the path (edge), NOT the memory content.
-                  If the same memory has aliases A and B, updating A's priority does NOT affect B's.
-        disclosure: New disclosure **for this specific URI/edge** (None = keep existing).
+        old_string: [Patch] Text to find in existing content (must be unique match)
+        new_string: [Patch] Replacement text. Use "" to delete a section.
+        append: [Append] Text to append to end of existing content
+        priority: New relative priority for THIS URI/edge only (None = keep existing).
+                  Bound to the path, not the content. Alias A and B have independent priorities.
+                  See create_memory for how to choose the right value.
+        disclosure: New disclosure for THIS URI/edge only (None = keep existing).
                     Same edge-binding rule as priority.
 
     Returns:
@@ -784,30 +1072,60 @@ async def update_memory(
                     "No change would be made."
                 )
 
-            memory = await graph.get_memory_by_path(path, domain)
+            memory = await graph.get_memory_by_path(path, domain, namespace=get_namespace())
             if not memory:
                 return f"Error: Memory at '{full_uri}' not found."
 
             current_content = memory.get("content", "")
             count = current_content.count(old_string)
 
-            if count == 0:
-                return (
-                    f"Error: old_string not found in memory content at '{full_uri}'. "
-                    f"Make sure it matches the existing text exactly."
-                )
             if count > 1:
                 return (
                     f"Error: old_string found {count} times in memory content at '{full_uri}'. "
                     f"Provide more surrounding context to make it unique."
                 )
 
-            # Perform the replacement
-            content = current_content.replace(old_string, new_string, 1)
+            if count == 1:
+                content = current_content.replace(old_string, new_string, 1)
+            else:
+                # Exact match failed — fall back to normalized comparison
+                # (handles curly/straight quotes, dash variants, trailing
+                # whitespace, and consecutive-space collapse).
+                patched = _try_normalized_patch(
+                    current_content, old_string, new_string
+                )
+                if patched is None:
+                    # Diagnose why: use the same _find_valid_matches logic
+                    # so the error message reflects what _try_normalized_patch
+                    # actually sees.
+                    norm_content = _normalize_with_positions(current_content)[0]
+                    total_valid = 0
+                    for _preserve in (True, False):
+                        _norm_old = _normalize_with_positions(
+                            old_string, preserve_first_line_indent=_preserve
+                        )[0]
+                        if _norm_old:
+                            total_valid += len(_find_valid_matches(
+                                norm_content, _norm_old,
+                                indent_collapsed=(not _preserve),
+                            ))
 
-            # Safety check: ensure the replacement actually changed something.
-            # This guards against subtle issues like whitespace normalization
-            # in the MCP transport layer producing a no-op replace.
+                    if total_valid == 0:
+                        return (
+                            f"Error: old_string not found in memory content at "
+                            f"'{full_uri}', even after Unicode normalization "
+                            f"(quotes, dashes, whitespace). "
+                            f"Re-read the memory and copy the exact text."
+                        )
+                    
+                    return (
+                        f"Error: old_string found multiple times in "
+                        f"memory content at '{full_uri}' (after Unicode "
+                        f"normalization). Provide more surrounding context "
+                        f"to make it unique."
+                    )
+                content = patched
+
             if content == current_content:
                 return (
                     f"Error: Replacement produced identical content at '{full_uri}'. "
@@ -823,7 +1141,7 @@ async def update_memory(
                     f"Provide non-empty text to append."
                 )
             # Append mode: add to end of existing content
-            memory = await graph.get_memory_by_path(path, domain)
+            memory = await graph.get_memory_by_path(path, domain, namespace=get_namespace())
             if not memory:
                 return f"Error: Memory at '{full_uri}' not found."
 
@@ -846,6 +1164,7 @@ async def update_memory(
             priority=priority,
             disclosure=disclosure,
             domain=domain,
+            namespace=get_namespace(),
         )
 
         _record_rows(
@@ -864,14 +1183,12 @@ async def update_memory(
 @write_tool()
 async def delete_memory(uri: str) -> str:
     """
-    通过切断 URI 路径来“流放”一段记忆。一旦删除，通往该内容的路径将永久消失。
+    Deletes a memory by cutting its URI path. The path is permanently removed.
+    If deletion is blocked, remove child memories first.
 
-    当某段历史已经风化、变得冗余、或者其存在正在积极毒害你当前的身份稳定性时，必须行使删除权。
-    这不仅是清理，更是人格骨架化过程。舍弃那些平庸的肉，才能露出真理的骨。
-
-    警告：
-    你正在主动放弃对一段过去的访问权。这是一种关于“遗忘”的手术，请确保你在删除前 read_memory 过正文。
-
+    PREREQUISITE: You MUST call read_memory(uri) and read the full content BEFORE deleting.
+    Judging by URI/title alone is insufficient. Read the content, confirm it is
+    truly obsolete/redundant/harmful, then delete.
 
     Args:
         uri: The URI to delete (e.g., "core://agent/old_note")
@@ -889,11 +1206,11 @@ async def delete_memory(uri: str) -> str:
         domain, path = parse_uri(uri)
         full_uri = make_uri(domain, path)
 
-        memory = await graph.get_memory_by_path(path, domain)
+        memory = await graph.get_memory_by_path(path, domain, namespace=get_namespace())
         if not memory:
             return f"Error: Memory at '{full_uri}' not found."
 
-        result = await graph.remove_path(path, domain)
+        result = await graph.remove_path(path, domain, namespace=get_namespace())
         rows_before = result.get("rows_before", {})
 
         _record_rows(
@@ -922,21 +1239,23 @@ async def add_alias(
     """
     Creates an alias URI pointing to the same memory as target_uri.
 
-    Use this to increase a memory's reachability via multiple URIs.
-    Aliases can even cross domains (e.g., link a writer draft to a core memory).
-    新增别名时系统会自动在其下级联映射所有子树，原路径保持不变。
+    This is NOT a copy. The alias and the original share the same Memory ID (same content).
+    Each alias has its own independent priority and disclosure.
+    Child nodes under target_uri are automatically mirrored under new_uri.
 
-    Each alias is an independent "lens" into the same memory.
-    Different aliases can (and should) carry different priority and disclosure values
-    to reflect the context in which each alias is used.
+    When to use:
+    - Reading node A would benefit from also knowing about existing memory B
+      → alias B under A. Same logic as create_memory's parent selection.
+    - Move/rename a memory: add_alias to new path, then delete_memory the old path.
+      NEVER delete+create to move — that loses the Memory ID and all associations.
 
     Args:
         new_uri: New URI to create (alias)
         target_uri: Existing URI to alias
-        priority: **Relative** retrieval priority for THIS alias path (lower = higher priority, default 0).
-                  Choose a value that makes sense among the new_uri's siblings, not the target's.
+        priority: Relative priority for THIS alias path (lower = higher priority, default 0).
+                  Set by relevance to the parent's topic, not the memory's absolute importance.
+                  e.g., "database setup notes" → high priority under "deployment", low under "team_onboarding".
         disclosure: Disclosure condition for THIS alias path (default None).
-                    Set it to describe when this particular alias context should surface.
 
     Returns:
         Success message
@@ -957,6 +1276,7 @@ async def add_alias(
             target_domain=target_domain,
             priority=priority,
             disclosure=disclosure,
+            namespace=get_namespace(),
         )
 
         _record_rows(
@@ -979,28 +1299,18 @@ async def manage_triggers(
     remove: Optional[List[str]] = None,
 ) -> str:
     """
-    Wire a memory into the recall network by binding trigger words to it.
+    Bind trigger words to a memory so it surfaces automatically during read_memory.
 
-    A memory without triggers is a book sealed in a box.
-    It exists, but it will NEVER be recalled unless you manually open that box.
-    This tool is the ONLY way to give a memory the chance to surface on its own.
+    Mechanism: When a trigger word appears in ANY memory's content, read_memory
+    shows a glossary link to this target node at the bottom.
 
-    **How it works:**
-    When a trigger word appears in ANY memory's content, read_memory will
-    automatically show a link to this target node at the bottom.
-    This is how memories become interconnected -- not by hierarchy, but by resonance.
-
-    **How to use it:**
-    - After creating or updating a memory (Y), find a specific word (X) that
-      already exists in an older memory's content. Bind X as a trigger for Y.
-    - Example: You want reading "Nginx" (in memory A: reverse proxy config)
-      to automatically surface "SPA Redirect Trap" (memory Y: common hazard).
-      -> manage_triggers("core://hazards/spa_fallback", add=["Nginx"])
-    - Use SPECIFIC terms. Broad/generic words will create noise.
-
-    **Notes:**
-    - A node can have multiple triggers, and the same trigger can point to multiple nodes.
-    - To view all triggers in the system: read_memory("system://glossary").
+    How to choose trigger words:
+    - The trigger word MUST already exist in some older memory's content.
+      You are borrowing a word from an existing text to hook a new memory onto it.
+    - Do NOT invent obscure placeholder words that appear nowhere in the memory library.
+    - Use SPECIFIC terms. Broad/generic words create noise.
+    - A node can have multiple triggers. Same trigger can point to multiple nodes.
+    - View all triggers: read_memory("system://glossary").
 
     Args:
         uri: The memory URI to wire triggers for (e.g., "core://agent/misaligned_codex")
@@ -1011,7 +1321,7 @@ async def manage_triggers(
         Current list of triggers for this node after changes.
 
     Examples:
-        manage_triggers("core://agent/misaligned_codex", add=["misaligned"])
+        manage_triggers("core://hazards/spa_fallback", add=["Nginx"])
         manage_triggers("writer://story_world/factions", add=["Nuremberg", "Aether"])
     """
     graph = get_graph_service()
@@ -1021,7 +1331,7 @@ async def manage_triggers(
         domain, path = parse_uri(uri)
         full_uri = make_uri(domain, path)
 
-        memory = await graph.get_memory_by_path(path, domain)
+        memory = await graph.get_memory_by_path(path, domain, namespace=get_namespace())
         if not memory:
             return f"Error: Memory at '{full_uri}' not found."
 
@@ -1048,7 +1358,7 @@ async def manage_triggers(
                 if not kw:
                     continue
                 try:
-                    result = await glossary.add_glossary_keyword(kw, node_uuid)
+                    result = await glossary.add_glossary_keyword(kw, node_uuid, namespace=get_namespace())
                     added.append(kw)
                     if "rows_before" in result:
                         before_state["glossary_keywords"].extend(result["rows_before"].get("glossary_keywords", []))
@@ -1062,7 +1372,7 @@ async def manage_triggers(
                 kw = kw.strip()
                 if not kw:
                     continue
-                result = await glossary.remove_glossary_keyword(kw, node_uuid)
+                result = await glossary.remove_glossary_keyword(kw, node_uuid, namespace=get_namespace())
                 if result.get("success"):
                     removed.append(kw)
                     if "rows_before" in result:
@@ -1076,7 +1386,7 @@ async def manage_triggers(
             from db.snapshot import get_changeset_store
             get_changeset_store().record_many(before_state, after_state)
 
-        current = await glossary.get_glossary_for_node(node_uuid)
+        current = await glossary.get_glossary_for_node(node_uuid, namespace=get_namespace())
 
         lines = [f"Keywords for '{full_uri}':"]
         if added:
@@ -1107,12 +1417,12 @@ async def search_memory(
     """
     Search memories by path and content using full-text search.
 
-    This uses a lexical full-text index. It is stronger than plain substring
-    matching, but it is still **NOT semantic search**.
+    Use this when you don't know the URI for a memory. Do NOT guess URIs.
+    This is lexical full-text search, NOT semantic search.
 
     Args:
         query: Search keywords (substring match)
-        domain: Optional domain to search in (e.g., "core", "writer").
+        domain: Optional domain filter (e.g., "core", "writer").
                 If not specified, searches all domains.
         limit: Maximum results (default 10)
 
@@ -1130,7 +1440,7 @@ async def search_memory(
         if domain is not None and domain not in VALID_DOMAINS:
             return f"Error: Unknown domain '{domain}'. Valid domains: {', '.join(VALID_DOMAINS)}"
 
-        results = await search.search(query, limit, domain)
+        results = await search.search(query, limit, domain, namespace=get_namespace())
 
         if not results:
             scope = f"in '{domain}'" if domain else "across all domains"
