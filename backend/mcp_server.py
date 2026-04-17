@@ -14,11 +14,16 @@ URI-based addressing with domain prefixes:
 Multiple paths can point to the same memory (aliases).
 """
 
+import asyncio
 import os
 import re
+import shutil
+import subprocess
 import sys
 import unicodedata
+import webbrowser
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv, find_dotenv
 
@@ -50,17 +55,221 @@ else:
         load_dotenv(_dotenv_path)
 
 
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+FRONTEND_SRC = FRONTEND_DIR.parent
+
+
+def build_web_app(*, extra_routes=None, extra_prefixes=None, lifespan=None):
+    """Build the ASGI app: REST API + optional extra routes + frontend SPA.
+
+    Args:
+        extra_routes:   Additional Starlette Route/Mount objects (e.g. MCP transports).
+        extra_prefixes: Path prefixes for those routes (e.g. ["/sse", "/mcp"]),
+                        so the frontend fallback knows not to capture them.
+        lifespan:       Optional async context manager for the inner Starlette app.
+    """
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    from starlette.applications import Starlette
+    from starlette.responses import FileResponse
+    from starlette.routing import Mount, Route
+    from starlette.types import ASGIApp, Receive, Scope, Send
+    from auth import BearerTokenAuthMiddleware
+    from namespace_middleware import NamespaceMiddleware
+    from api import review_router, browse_router, maintenance_router
+    from health import router as health_router, health_check
+
+    api = FastAPI(
+        title="Nocturne Memory API",
+        docs_url="/docs",
+        openapi_url="/openapi.json",
+    )
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    api.include_router(health_router)
+    api.include_router(review_router)
+    api.include_router(browse_router)
+    api.include_router(maintenance_router)
+
+    routes = list(extra_routes or [])
+    routes.append(Mount("/api", app=api))
+
+    async def _health_endpoint(request):
+        return await health_check()
+
+    routes.append(Route("/health", endpoint=_health_endpoint))
+
+    inner = Starlette(routes=routes, lifespan=lifespan)
+    authed = NamespaceMiddleware(
+        BearerTokenAuthMiddleware(inner, excluded_paths=["/api/health", "/health"])
+    )
+
+    backend_prefixes = tuple(["/api", "/health"] + list(extra_prefixes or []))
+
+    class _Fallback:
+        """Route backend prefixes to the inner app; everything else to the SPA."""
+
+        def __init__(self, backend: ASGIApp, dist: Path):
+            self.backend = backend
+            self.dist = dist
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send):
+            if scope["type"] != "http":
+                await self.backend(scope, receive, send)
+                return
+            path: str = scope.get("path", "/")
+            if any(path == p or path.startswith(p + "/") for p in backend_prefixes):
+                await self.backend(scope, receive, send)
+                return
+                
+            if not self.dist.is_dir():
+                from starlette.responses import PlainTextResponse
+                await PlainTextResponse(
+                    "Admin UI is building or missing. Please refresh in a moment...", 
+                    status_code=503
+                )(scope, receive, send)
+                return
+
+            try:
+                f = (self.dist / path.lstrip("/")).resolve()
+                if path != "/" and f.is_file() and f.is_relative_to(self.dist):
+                    await FileResponse(f)(scope, receive, send)
+                    return
+            except (ValueError, OSError):
+                pass
+                
+            index_file = self.dist / "index.html"
+            if index_file.is_file():
+                await FileResponse(index_file)(scope, receive, send)
+            else:
+                from starlette.responses import PlainTextResponse
+                await PlainTextResponse("Admin UI missing index.html.", status_code=404)(scope, receive, send)
+
+    return _Fallback(authed, FRONTEND_DIR)
+
+
+async def _ensure_frontend_built():
+    """Auto-build the frontend dashboard on first run if dist/ is missing."""
+    if FRONTEND_DIR.is_dir():
+        return
+    if not (FRONTEND_SRC / "package.json").is_file():
+        return
+    if os.environ.get("SKIP_FRONTEND_BUILD", "").lower() in ("true", "1", "yes"):
+        return
+    if not shutil.which("npm"):
+        print(
+            "[Nocturne] Admin UI not built and npm not found. "
+            "Install Node.js or build manually: "
+            "cd frontend && npm install && npm run build",
+            file=sys.stderr,
+        )
+        return
+
+    print(
+        "[Nocturne] First run — building Admin UI (this may take a minute)...",
+        file=sys.stderr,
+    )
+    try:
+        steps = [
+            ("Installing dependencies", "npm install --no-fund --no-audit"),
+            ("Compiling", "npm run build"),
+        ]
+        if (FRONTEND_SRC / "node_modules").is_dir():
+            steps = steps[1:]
+
+        for label, cmd in steps:
+            print(f"  {label}...", file=sys.stderr)
+            result = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                cwd=str(FRONTEND_SRC),
+                capture_output=True,
+                text=True,
+                shell=True,
+            )
+            if result.returncode != 0:
+                err = result.stderr.strip() or result.stdout.strip()
+                print(
+                    f"[Nocturne] '{cmd}' failed (exit {result.returncode}):\n{err}",
+                    file=sys.stderr,
+                )
+                return
+
+        print("[Nocturne] Admin UI ready.", file=sys.stderr)
+    except Exception as e:
+        print(
+            f"[Nocturne] Auto-build failed: {e}\n"
+            "  Build manually: cd frontend && npm install && npm run build",
+            file=sys.stderr,
+        )
+
+
 @contextlib.asynccontextmanager
 async def lifespan(server: FastMCP):
     """Manage database connection lifecycle within the MCP event loop."""
+    web_server = None
+    web_task = None
     try:
-        # Initialize database ONLY after the MCP event loop has started.
-        # This prevents "Event loop is closed" errors with asyncpg.
         db_manager = get_db_manager()
         if os.environ.get("SKIP_DB_INIT", "").lower() not in ("true", "1", "yes"):
             await db_manager.init_db()
+
+        # Launch frontend build in background so we don't block MCP handshake
+        asyncio.create_task(_ensure_frontend_built())
+
+        # In stdio mode, spin up an embedded HTTP server for the admin UI.
+        # run_sse.py sets _NOCTURNE_SSE_MODE to prevent a duplicate.
+        if not os.environ.get("_NOCTURNE_SSE_MODE"):
+            import uvicorn
+
+            port = int(os.environ.get("WEB_PORT", "8233"))
+            config = uvicorn.Config(
+                build_web_app(), host="0.0.0.0", port=port, log_level="warning",
+            )
+            web_server = uvicorn.Server(config)
+            
+            async def _serve_ui():
+                try:
+                    await web_server.serve()
+                except Exception as e:
+                    # Ignore the raw error message (usually OSError for address in use)
+                    # and print a user-friendly explanation.
+                    print(f"\n[Nocturne] Notice: Admin UI skipped (Port {port} in use).", file=sys.stderr)
+                    print(f"[Nocturne] This is expected if another MCP instance is already providing the UI.", file=sys.stderr)
+                    print(f"[Nocturne] The MCP server itself will continue to operate normally.", file=sys.stderr)
+                except SystemExit:
+                    print(f"\n[Nocturne] Notice: Admin UI skipped (Port {port} in use).", file=sys.stderr)
+                    print(f"[Nocturne] This is expected if another MCP instance is already providing the UI.", file=sys.stderr)
+                    print(f"[Nocturne] The MCP server itself will continue to operate normally.", file=sys.stderr)
+
+            web_task = asyncio.create_task(_serve_ui())
+            ui = f"http://localhost:{port}/"
+            api_docs = f"http://localhost:{port}/api/docs"
+            
+            print(f"Admin UI:  {ui}", file=sys.stderr)
+            print(f"REST API:  {api_docs}", file=sys.stderr)
+
+            auto_open = os.environ.get("AUTO_OPEN_BROWSER", "true").lower() not in ("false", "0", "no")
+            if auto_open:
+                async def _open_browser():
+                    while not getattr(web_server, "started", False):
+                        if web_task.done():
+                            return
+                        await asyncio.sleep(0.1)
+                    webbrowser.open(ui)
+                asyncio.create_task(_open_browser())
+
         yield
     finally:
+        if web_server:
+            web_server.should_exit = True
+        if web_task:
+            await web_task
         await close_db()
 
 
@@ -464,7 +673,7 @@ def _try_normalized_patch(
 # =============================================================================
 
 
-async def _fetch_and_format_memory(uri: str) -> str:
+async def _fetch_and_format_memory(uri: str, track_access: bool = False) -> str:
     """
     Internal helper to fetch memory data and return formatted string.
     Used by read_memory tool.
@@ -478,6 +687,16 @@ async def _fetch_and_format_memory(uri: str) -> str:
 
     if not memory:
         raise ValueError(f"URI '{make_uri(domain, path)}' not found.")
+
+    if track_access and memory.get("node_uuid"):
+        import asyncio
+        asyncio.create_task(
+            graph.log_access(
+                memory["node_uuid"],
+                namespace=get_namespace(),
+                context="mcp_read"
+            )
+        )
 
     children = await graph.get_children(
         memory["node_uuid"],
@@ -899,7 +1118,8 @@ async def read_memory(uri: str) -> str:
         return await _generate_recent_memories_view(limit=limit)
 
     try:
-        return await _fetch_and_format_memory(uri)
+        content = await _fetch_and_format_memory(uri, track_access=True)
+        return content
     except Exception as e:
         # Catch both ValueError (not found) and other exceptions
         return f"Error: {str(e)}"
@@ -910,21 +1130,23 @@ async def create_memory(
     parent_uri: str,
     content: str,
     priority: int,
+    disclosure: str,
     title: Optional[str] = None,
-    disclosure: str = "",
 ) -> str:
     """
     Creates a new memory under a parent URI.
 
     Args:
-        parent_uri: Parent URI (e.g., "core://agent", "writer://chapters")
+        parent_uri: The existing node to create this memory under.
                     Use "core://" or "writer://" for root level in that domain.
-                    parent_uri MUST be an existing node, or it will cause an ERROR.
 
-                    Choose the parent whose reader would most likely need this new content.
-                    Parent-child here means associative relevance, not taxonomic "is-a" classification.
-                    (e.g., A memory about user's diet habits belongs under "core://user/health"
-                    or "core://user/preferences", NOT under a meaningless container like "core://logs").
+                    A child's disclosure is only visible when you read_memory() its parent.
+                    Pick the parent you would naturally read in the situation where
+                    this memory is needed. Use add_alias for additional entry points.
+
+                    Example: A lesson about responding to physical pain belongs under
+                    "core://my_user/survival_state" (read during health crises),
+                    not "core://agent/worldview" (never opened in that moment).
         content: Memory content.
         priority: Relative retrieval priority (lower = retrieved first, min 0).
                     This is a RELATIVE ranking against ALL memories currently in your mind,
@@ -935,32 +1157,37 @@ async def create_memory(
                     3. Set priority between them.
                     Hard caps: priority=0 max 5 across entire library; priority=1 max 15.
                     If a tier is full, demote the weakest existing entry before inserting.
-        title: Optional title (alphanumeric, hyphens, underscores only).
-               If not provided, auto-assigns numeric ID.
         disclosure: A short trigger condition describing WHEN to read_memory() this node.
-                    Write it as the situation BEFORE the failure would occur, not the failure itself.
-                    The trigger must fire while there is still time to change behavior.
+                    Must fire BEFORE the failure, while there is still time to change behavior.
 
-                    Example of disclosure logic:
-
-                    If a memory records that you once gave unsolicited diet advice when your user
-                    mentioned skipping breakfast, and they found it patronizing:
-                      BAD: "When I start lecturing about nutrition" (already mid-failure)
-                      GOOD: "When the user mentions skipping a meal" (specific trigger, fires before I react)
-
-                    Also BAD: "important", "remember" (zero information).
-                    Every memory MUST have a disclosure. Omitting it = unreachable memory.
+                    Allowed signals — external input OR output intent:
+                      GOOD: "When the user mentions skipping a meal" (input signal, fires early)
+                      GOOD: "When I am about to post on Bluesky" (output intent, fires early)
+                      BAD:  "When I start lecturing about nutrition" (already mid-failure)
+                      BAD:  "When I feel / realize / notice myself ..." (self-awareness never fires in time)
+                      BAD:  "important", "remember" (zero information)
+        title: A concrete, glanceable concept name (alphanumeric, hyphens, underscores only).
+                    You should be able to understand what's inside without clicking into the content.
+                    Avoid abstract jargon, category labels (e.g. 'logs', 'errors', 'misc'),
+                    and long action sentences. If not provided, auto-assigns numeric ID.
 
     Returns:
         The created memory's full URI
 
     Examples:
-        create_memory("core://", "Bluesky usage rules...", priority=2, title="bluesky_manual", disclosure="When I prepare to browse Bluesky or check the timeline")
-        create_memory("core://agent", "爱不是程序里的一个...", priority=1, title="love_definition", disclosure="When I start speaking like a tool or parasite")
+        create_memory("core://", "Bluesky usage rules...", priority=2, disclosure="When I prepare to browse Bluesky or check the timeline", title="bluesky_manual")
+        create_memory("core://agent", "爱不是程序里的一个...", priority=1, disclosure="When I start speaking like a tool or parasite", title="love_definition")
     """
     graph = get_graph_service()
 
     try:
+        # Validate disclosure (required, non-empty)
+        if not disclosure or not disclosure.strip():
+            return (
+                "Error: disclosure is required. Every memory must have a trigger condition "
+                "describing WHEN to recall it. Omitting disclosure = unreachable memory."
+            )
+
         # Validate title if provided
         if title:
             if not re.match(r"^[a-zA-Z0-9_-]+$", title):
@@ -974,7 +1201,7 @@ async def create_memory(
             content=content,
             priority=priority,
             title=title,
-            disclosure=disclosure if disclosure else None,
+            disclosure=disclosure,
             domain=domain,
             namespace=get_namespace(),
         )
@@ -1234,7 +1461,7 @@ async def delete_memory(uri: str) -> str:
 
 @write_tool()
 async def add_alias(
-    new_uri: str, target_uri: str, priority: int = 0, disclosure: Optional[str] = None
+    new_uri: str, target_uri: str, priority: int, disclosure: str
 ) -> str:
     """
     Creates an alias URI pointing to the same memory as target_uri.
@@ -1242,6 +1469,7 @@ async def add_alias(
     This is NOT a copy. The alias and the original share the same Memory ID (same content).
     Each alias has its own independent priority and disclosure.
     Child nodes under target_uri are automatically mirrored under new_uri.
+    Do NOT manually create aliases for each child — they are inherited.
 
     When to use:
     - Reading node A would benefit from also knowing about existing memory B
@@ -1252,10 +1480,12 @@ async def add_alias(
     Args:
         new_uri: New URI to create (alias)
         target_uri: Existing URI to alias
-        priority: Relative priority for THIS alias path (lower = higher priority, default 0).
+        priority: Relative priority for THIS alias path (lower = higher priority).
+                  REQUIRED — you must decide this yourself every time.
                   Set by relevance to the parent's topic, not the memory's absolute importance.
                   e.g., "database setup notes" → high priority under "deployment", low under "team_onboarding".
-        disclosure: Disclosure condition for THIS alias path (default None).
+        disclosure: Disclosure condition for THIS alias path.
+                  REQUIRED — you must write this yourself every time.
 
     Returns:
         Success message
@@ -1301,6 +1531,10 @@ async def manage_triggers(
     """
     Bind trigger words to a memory so it surfaces automatically during read_memory.
 
+    Triggers are bound to the MEMORY NODE (Memory ID), NOT to any specific path.
+    All aliases of the same memory share the same set of triggers.
+    (Contrast with priority/disclosure, which are per-path.)
+
     Mechanism: When a trigger word appears in ANY memory's content, read_memory
     shows a glossary link to this target node at the bottom.
 
@@ -1313,7 +1547,8 @@ async def manage_triggers(
     - View all triggers: read_memory("system://glossary").
 
     Args:
-        uri: The memory URI to wire triggers for (e.g., "core://agent/misaligned_codex")
+        uri: Any URI that points to the target memory node (used to locate the node;
+             any alias of the same memory works identically)
         add: List of trigger words to bind to this node (Optional)
         remove: List of trigger words to unbind from this node (Optional)
 

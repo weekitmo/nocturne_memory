@@ -32,7 +32,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Graph API",
     description="AI长期记忆知识图谱后端",
-    version="2.1.1",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
@@ -62,10 +62,10 @@ app.include_router(maintenance_router)
 @app.get("/")
 async def root():
     """根路径"""
-    return {"message": "Knowledge Graph API", "version": "2.1.1", "docs": "/docs"}
+    return {"message": "Knowledge Graph API", "version": "2.3.0", "docs": "/docs"}
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8233)
