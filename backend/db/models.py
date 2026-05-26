@@ -22,6 +22,8 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     UniqueConstraint,
+    Index,
+    text,
 )
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -78,7 +80,7 @@ class Node(Base):
     __tablename__ = "nodes"
 
     uuid = Column(String(36), primary_key=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
     last_accessed_at = Column(DateTime, nullable=True)
 
     memories = relationship("Memory", back_populates="node")
@@ -104,7 +106,7 @@ class Memory(Base):
     content = Column(Text, nullable=False)
     deprecated = Column(Boolean, default=False)
     migrated_to = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
 
     node = relationship("Node", back_populates="memories")
 
@@ -125,7 +127,7 @@ class Edge(Base):
     name = Column(String(256), nullable=False)
     priority = Column(Integer, default=0)
     disclosure = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
         UniqueConstraint("parent_uuid", "child_uuid", name="uq_edge_parent_child"),
@@ -154,9 +156,16 @@ class Path(Base):
     domain = Column(String(64), primary_key=True, default="core")
     path = Column(String(512), primary_key=True)
     edge_id = Column(Integer, ForeignKey("edges.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    node_uuid = Column(
+        String(36),
+        ForeignKey("nodes.uuid"),
+        nullable=True,
+        index=True,
+    )
+    created_at = Column(DateTime, default=datetime.now)
 
     edge = relationship("Edge", back_populates="paths")
+    node = relationship("Node")
 
 
 class GlossaryKeyword(Base):
@@ -178,7 +187,7 @@ class GlossaryKeyword(Base):
         nullable=False,
     )
     namespace = Column(String(64), nullable=False, default="")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
         UniqueConstraint("keyword", "node_uuid", "namespace", name="uq_glossary_keyword_node"),
@@ -212,7 +221,7 @@ class SearchDocument(Base):
     # Stores glossary keywords plus auxiliary CJK search terms.
     search_terms = Column(Text, nullable=False, default="")
     priority = Column(Integer, nullable=False, default=0)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.now)
 
 
 class MemoryAccessLog(Base):
@@ -228,10 +237,38 @@ class MemoryAccessLog(Base):
         index=True,
     )
     namespace = Column(String(64), nullable=False, default="")
-    accessed_at = Column(DateTime, default=datetime.utcnow, index=True)
+    accessed_at = Column(DateTime, default=datetime.now, index=True)
     context = Column(String(64), nullable=True)
 
     node = relationship("Node")
+
+
+class Preset(Base):
+    """Boot URI preset — a named set of boot URIs and path masks.
+
+    Only one preset can be active at a time (is_active=True).
+    The active preset determines which URIs are loaded at boot.
+    """
+
+    __tablename__ = "presets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(Text, nullable=False, unique=True)
+    boot_uris = Column(Text, nullable=False, default="{}")
+    path_masks = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        Index(
+            "uq_presets_active",
+            "is_active",
+            unique=True,
+            postgresql_where=text("is_active = true"),
+            sqlite_where=text("is_active = 1"),
+        ),
+    )
 
 
 # =============================================================================

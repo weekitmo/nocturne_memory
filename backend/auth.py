@@ -1,19 +1,13 @@
 from __future__ import annotations
 
-import os
 import secrets
+from pathlib import Path
 from typing import Iterable, Sequence
 
-from dotenv import find_dotenv, load_dotenv
+import config as _cfg
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
-
-
-# 尽早加载 .env，确保独立导入本模块时也能读取 API_TOKEN。
-_dotenv_path = find_dotenv(usecwd=True)
-if _dotenv_path:
-    load_dotenv(_dotenv_path)
 
 
 UNAUTHORIZED_MESSAGE = {"detail": "Unauthorized"}
@@ -42,7 +36,7 @@ def is_excluded_path(path: str, excluded_paths: Iterable[str] | None = None) -> 
 
 
 def get_api_token() -> str | None:
-    return os.environ.get("API_TOKEN")
+    return _cfg.get("api_token")
 
 
 def _unauthorized_response() -> JSONResponse:
@@ -57,7 +51,7 @@ async def verify_token(
 
     Args:
         request: Starlette/FastAPI 请求对象。
-        expected_token: 可选的预读 token；未传入时会从环境变量读取。
+        expected_token: 可选的预读 token；未传入时会从 config.json 读取。
 
     Returns:
         校验失败时返回 401 JSONResponse，成功时返回 None。
@@ -65,7 +59,6 @@ async def verify_token(
 
     token = expected_token if expected_token is not None else get_api_token()
     
-    # 如果没有设置 token，默认不进行验证
     if not token:
         return None
     authorization = request.headers.get("Authorization", "")
@@ -101,7 +94,6 @@ class BearerTokenAuthMiddleware:
         self.expected_token = get_api_token()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        # 如果没有配置 Token，直接放行所有 HTTP 请求
         if not self.expected_token:
             await self.app(scope, receive, send)
             return
@@ -124,10 +116,88 @@ class BearerTokenAuthMiddleware:
         await self.app(scope, receive, send)
 
 
+def get_cors_config() -> dict:
+    """Return kwargs for CORSMiddleware based on cors_origins in config.json.
+
+    - Unset / empty  → regex that matches localhost / 127.0.0.1 on any port
+    - "*"            → allow all origins
+    - Comma-list     → exact-match those origins
+    """
+    raw = _cfg.get("cors_origins")
+    if raw == "*":
+        return {"allow_origins": ["*"]}
+    if raw:
+        if isinstance(raw, list):
+            return {"allow_origins": raw}
+        return {"allow_origins": [o.strip() for o in raw.split(",") if o.strip()]}
+    return {"allow_origin_regex": r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"}
+
+
+def enforce_network_auth(*, host: str = "0.0.0.0") -> None:
+    """Refuse to start an HTTP/SSE server without API_TOKEN.
+
+    Raises RuntimeError when API_TOKEN is empty/unset. Call this before
+    uvicorn.run() in any network-facing entry point (run_sse.py, main.py).
+    """
+    token = get_api_token()
+    if token and len(token) < 32:
+        raise RuntimeError(
+            f"API_TOKEN is too short ({len(token)} chars). "
+            f"Use at least 32 characters for security."
+        )
+    if token:
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            print(
+                f"  Auth enabled (HOST={host}). "
+                f"MCP clients must send the header:\n"
+                f"      Authorization: Bearer <your-API_TOKEN>\n"
+                f"  See README for client configuration examples.",
+            )
+        return
+    is_localhost = host in ("127.0.0.1", "localhost", "::1")
+    if is_localhost:
+        import warnings
+        warnings.warn(
+            "API_TOKEN is not set. The server is binding to localhost only, "
+            "but setting API_TOKEN is still strongly recommended.",
+            stacklevel=2,
+        )
+        return
+    if Path("/.dockerenv").exists():
+        raise RuntimeError(
+            f"\n\n"
+            f"  API_TOKEN is not set, but HOST={host!r} is network-reachable.\n"
+            f"\n"
+            f"  Docker fix:\n"
+            f"\n"
+            f"    python scripts/setup_docker.py\n"
+            f"    docker compose up -d --build\n"
+            f"\n"
+            f"  This creates/migrates config.json and prints the Bearer token "
+            f"for your MCP client.\n"
+        )
+    raise RuntimeError(
+        f"\n\n"
+        f"  API_TOKEN is not set, but HOST={host!r} is network-reachable.\n"
+        f"\n"
+        f"  Fix: set api_token in config.json:\n"
+        f"\n"
+        f"    python -c \"import secrets; print(secrets.token_urlsafe(32))\"\n"
+        f"\n"
+        f"  Copy the output into config.json as:  \"api_token\": \"<paste here>\"\n"
+        f"  Then update your MCP client config to include:\n"
+        f"      \"headers\": {{\"Authorization\": \"Bearer <your-api_token>\"}}\n"
+        f"\n"
+        f"  Or set \"host\": \"127.0.0.1\" in config.json to only allow local connections.\n"
+    )
+
+
 __all__ = [
     "BearerTokenAuthMiddleware",
     "UNAUTHORIZED_MESSAGE",
+    "enforce_network_auth",
     "get_api_token",
+    "get_cors_config",
     "is_excluded_path",
     "verify_token",
 ]

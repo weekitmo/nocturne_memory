@@ -13,7 +13,10 @@ import uvicorn
 # Ensure we can import from backend dir
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from mcp_server import mcp, build_web_app, FRONTEND_DIR
+import config as _cfg
+from auth import enforce_network_auth
+from mcp_server import mcp
+from web_app import build_web_app
 
 
 def main():
@@ -23,6 +26,12 @@ def main():
     After running `npm run build` in frontend/, the admin UI is accessible
     at the same port — no separate dev server needed.
     """
+    _cfg.ensure_config_exists()
+    port = int(_cfg.get("web_port"))
+    host = _cfg.get("host")
+
+    enforce_network_auth(host=host)
+
     print("Initializing Nocturne Memory Server...")
 
     # --- MCP transports ---
@@ -44,17 +53,13 @@ def main():
         lifespan=combined_lifespan,
     )
 
-    port = int(os.getenv("PORT", 8233))
-    host = os.getenv("HOST", "0.0.0.0")
-
     print(f"Server starting on http://{host}:{port}")
     print(f"  MCP (SSE):   http://{host}:{port}/sse")
     print(f"  MCP (HTTP):  http://{host}:{port}/mcp")
     print(f"  REST API:    http://{host}:{port}/api/docs")
     print(f"  Admin UI:    http://{host}:{port}/")
 
-    auto_open = os.environ.get("AUTO_OPEN_BROWSER", "true").lower() not in ("false", "0", "no")
-    if auto_open:
+    if _cfg.get("auto_open_browser"):
         def _open_browser():
             time.sleep(1.5)
             webbrowser.open(f"http://localhost:{port}/")
