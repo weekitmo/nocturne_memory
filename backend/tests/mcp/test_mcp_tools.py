@@ -27,6 +27,41 @@ async def test_read_memory_system_views(mcp_module, graph_service):
     assert "requires a domain" in index_error
 
 
+async def test_mcp_resources_expose_memory_uri_templates(mcp_module, graph_service):
+    await graph_service.create_memory(
+        parent_path="",
+        content="Agent identity resource",
+        priority=1,
+        title="agent",
+        disclosure="When testing resources",
+    )
+    await graph_service.create_memory(
+        parent_path="agent",
+        content="Nested user resource",
+        priority=1,
+        title="my_user",
+        disclosure="When testing nested resources",
+    )
+
+    resources = await mcp_module.mcp.list_resources()
+    templates = await mcp_module.mcp.list_resource_templates()
+    boot = await mcp_module.mcp.read_resource("system://boot")
+    agent = await mcp_module.mcp.read_resource("core://agent")
+    nested = await mcp_module.mcp.read_resource("core://agent/my_user")
+
+    resource_uris = {str(resource.uri) for resource in resources}
+    template_uris = {template.uriTemplate for template in templates}
+
+    assert "system://boot" in resource_uris
+    assert "system://{view}" in template_uris
+    assert "system://{view}/{arg}" in template_uris
+    assert "{domain}://{path0}" in template_uris
+    assert "{domain}://{path0}/{path1}" in template_uris
+    assert "core://agent" in boot[0].content
+    assert "Agent identity resource" in agent[0].content
+    assert "Nested user resource" in nested[0].content
+
+
 async def test_diagnostic_view_points_duplicate_aliases_to_delete_memory(mcp_module):
     await mcp_module.create_memory(
         "core://",

@@ -1103,5 +1103,178 @@ async def search_memory(
 # =============================================================================
 
 
+@mcp.resource(
+    "system://boot",
+    name="system_boot",
+    title="System Boot Memory",
+    description="Startup memory view. Equivalent to read_memory('system://boot').",
+    mime_type="text/plain",
+)
+async def system_boot_resource() -> str:
+    return await read_memory("system://boot")
+
+
+@mcp.resource(
+    "system://{view}",
+    name="system_view",
+    title="System Memory View",
+    description="System memory view such as glossary, recent, or index. Equivalent to read_memory('system://<view>').",
+    mime_type="text/plain",
+)
+async def system_view_resource(view: str) -> str:
+    return await read_memory(f"system://{view}")
+
+
+@mcp.resource(
+    "system://{view}/{arg}",
+    name="system_view_with_argument",
+    title="System Memory View With Argument",
+    description="System memory view with one path argument, such as index/core or diagnostic/core.",
+    mime_type="text/plain",
+)
+async def system_view_with_argument_resource(view: str, arg: str) -> str:
+    return await read_memory(f"system://{view}/{arg}")
+
+
+@mcp.resource(
+    "{domain}://",
+    name="memory_domain_root",
+    title="Memory Domain Root",
+    description="Root of a memory domain. Equivalent to read_memory('<domain>://').",
+    mime_type="text/plain",
+)
+async def memory_domain_root_resource(domain: str) -> str:
+    return await read_memory(f"{domain}://")
+
+
+def _memory_uri(domain: str, *parts: str) -> str:
+    return f"{domain}://{'/'.join(parts)}"
+
+
+@mcp.resource(
+    "{domain}://{path0}",
+    name="memory_by_uri_1",
+    title="Memory By URI",
+    description="Memory resource by URI. Equivalent to read_memory('<domain>://<path>').",
+    mime_type="text/plain",
+)
+async def memory_resource_1(domain: str, path0: str) -> str:
+    return await read_memory(_memory_uri(domain, path0))
+
+
+@mcp.resource(
+    "{domain}://{path0}/{path1}",
+    name="memory_by_uri_2",
+    title="Memory By URI",
+    description="Memory resource by two-segment URI path.",
+    mime_type="text/plain",
+)
+async def memory_resource_2(domain: str, path0: str, path1: str) -> str:
+    return await read_memory(_memory_uri(domain, path0, path1))
+
+
+@mcp.resource(
+    "{domain}://{path0}/{path1}/{path2}",
+    name="memory_by_uri_3",
+    title="Memory By URI",
+    description="Memory resource by three-segment URI path.",
+    mime_type="text/plain",
+)
+async def memory_resource_3(domain: str, path0: str, path1: str, path2: str) -> str:
+    return await read_memory(_memory_uri(domain, path0, path1, path2))
+
+
+@mcp.resource(
+    "{domain}://{path0}/{path1}/{path2}/{path3}",
+    name="memory_by_uri_4",
+    title="Memory By URI",
+    description="Memory resource by four-segment URI path.",
+    mime_type="text/plain",
+)
+async def memory_resource_4(
+    domain: str, path0: str, path1: str, path2: str, path3: str
+) -> str:
+    return await read_memory(_memory_uri(domain, path0, path1, path2, path3))
+
+
+@mcp.resource(
+    "{domain}://{path0}/{path1}/{path2}/{path3}/{path4}",
+    name="memory_by_uri_5",
+    title="Memory By URI",
+    description="Memory resource by five-segment URI path.",
+    mime_type="text/plain",
+)
+async def memory_resource_5(
+    domain: str, path0: str, path1: str, path2: str, path3: str, path4: str
+) -> str:
+    return await read_memory(_memory_uri(domain, path0, path1, path2, path3, path4))
+
+
+@mcp.resource(
+    "{domain}://{path0}/{path1}/{path2}/{path3}/{path4}/{path5}",
+    name="memory_by_uri_6",
+    title="Memory By URI",
+    description="Memory resource by six-segment URI path.",
+    mime_type="text/plain",
+)
+async def memory_resource_6(
+    domain: str,
+    path0: str,
+    path1: str,
+    path2: str,
+    path3: str,
+    path4: str,
+    path5: str,
+) -> str:
+    return await read_memory(
+        _memory_uri(domain, path0, path1, path2, path3, path4, path5)
+    )
+
+
+@mcp.resource(
+    "{domain}://{path0}/{path1}/{path2}/{path3}/{path4}/{path5}/{path6}",
+    name="memory_by_uri_7",
+    title="Memory By URI",
+    description="Memory resource by seven-segment URI path.",
+    mime_type="text/plain",
+)
+async def memory_resource_7(
+    domain: str,
+    path0: str,
+    path1: str,
+    path2: str,
+    path3: str,
+    path4: str,
+    path5: str,
+    path6: str,
+) -> str:
+    return await read_memory(
+        _memory_uri(domain, path0, path1, path2, path3, path4, path5, path6)
+    )
+
+
+@mcp.resource(
+    "{domain}://{path0}/{path1}/{path2}/{path3}/{path4}/{path5}/{path6}/{path7}",
+    name="memory_by_uri_8",
+    title="Memory By URI",
+    description="Memory resource by eight-segment URI path.",
+    mime_type="text/plain",
+)
+async def memory_resource_8(
+    domain: str,
+    path0: str,
+    path1: str,
+    path2: str,
+    path3: str,
+    path4: str,
+    path5: str,
+    path6: str,
+    path7: str,
+) -> str:
+    return await read_memory(
+        _memory_uri(domain, path0, path1, path2, path3, path4, path5, path6, path7)
+    )
+
+
 if __name__ == "__main__":
     mcp.run()
